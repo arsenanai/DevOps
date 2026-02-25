@@ -209,7 +209,7 @@ def get_recently_merged_prs(repo: str) -> list[dict]:
         "pr", "list",
         "--repo", repo,
         "--state", "merged",
-        "--json", "number,title,author,mergedAt",
+        "--json", "number,title,author,mergedAt,headRefOid",
         "--limit", "30",
     )
     prs = json.loads(output)
@@ -219,6 +219,24 @@ def get_recently_merged_prs(repo: str) -> list[dict]:
         if pr.get("mergedAt")
         and datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")) > cutoff
     ]
+
+
+def has_team_approval(repo: str, pr_number: int, pr_author: str) -> bool:
+    """
+    Return True if the PR has at least one APPROVED review from someone
+    other than the PR author (i.e. a real teammate sign-off).
+    """
+    output = run_gh(
+        "pr", "view", str(pr_number),
+        "--repo", repo,
+        "--json", "reviews",
+    )
+    reviews = json.loads(output).get("reviews", [])
+    return any(
+        r.get("state") == "APPROVED"
+        and (r.get("author") or {}).get("login", "") != pr_author
+        for r in reviews
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -476,9 +494,41 @@ def check_merged_prs(config: dict, state: dict) -> None:
                 state_changed = True
                 continue
 
-            # PR had Critical Issues and was merged — send alert
+            # PR had Critical Issues and was merged — check for team approval first
             title = pr["title"]
             author = pr["author"]["login"]
+
+            # If commits were pushed after our last review, we can't confirm the
+            # issues are still present — skip the alert to avoid false positives.
+            last_reviewed_sha = prev.get("sha", "")
+            merged_sha = pr.get("headRefOid", "")
+            if last_reviewed_sha and merged_sha and last_reviewed_sha != merged_sha:
+                print(
+                    f"  [{repo}] PR #{number} — new commits pushed after last review "
+                    f"(reviewed {last_reviewed_sha[:7]}, merged {merged_sha[:7]}); "
+                    f"skipping alert (issues may have been fixed)."
+                )
+                state[merge_key] = {"notified_at": None, "reason": "unreviewed_commits_at_merge"}
+                state_changed = True
+                continue
+
+            try:
+                approved = has_team_approval(repo, number, author)
+            except Exception as e:
+                print(
+                    f"  [{repo}] PR #{number} — could not fetch approval status: {e}",
+                    file=sys.stderr,
+                )
+                approved = False
+
+            if approved:
+                print(
+                    f"  [{repo}] PR #{number} — had critical issues but was approved "
+                    f"by a teammate, skipping alert."
+                )
+                state[merge_key] = {"notified_at": None, "reason": "approved_by_team"}
+                state_changed = True
+                continue
             pr_url = f"https://github.com/{repo}/pull/{number}"
             reviewed_at = prev.get("reviewed_at", "unknown")
             merged_at = pr.get("mergedAt", "unknown")
