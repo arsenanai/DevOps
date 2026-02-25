@@ -1,0 +1,21 @@
+{
+  "reviewer_username": "github_username",
+  "smtp": {
+    "host": "smtp.mail.com",
+    "port": 587,
+    "username": "YOUR_GMAIL_ADDRESS@gmail.com",
+    "password": "YOUR_GMAIL_APP_PASSWORD",
+    "from_email": "YOUR_GMAIL_ADDRESS@gmail.com",
+    "to_email": "YOUR_EMAIL@mail.com"
+  },
+  "repositories": [
+    {
+      "repo": "github_username/repo_name",
+      "name": "RepoName"
+    },
+    {
+      "repo": "github_username/repo_name2",
+      "name": "RepoName2"
+    }
+  ]
+}

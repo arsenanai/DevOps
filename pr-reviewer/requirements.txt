@@ -1,0 +1,1 @@
+# No Python dependencies — uses claude CLI (Claude Code) and gh CLI directly.
