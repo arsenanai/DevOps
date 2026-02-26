@@ -11,11 +11,13 @@
   "repositories": [
     {
       "repo": "github_username/repo_name",
-      "name": "RepoName"
+      "name": "RepoName",
+      "local_path": "C:/path/to/local/repo_name"
     },
     {
       "repo": "github_username/repo_name2",
-      "name": "RepoName2"
+      "name": "RepoName2",
+      "local_path": "C:/path/to/local/repo_name2"
     }
   ]
 }

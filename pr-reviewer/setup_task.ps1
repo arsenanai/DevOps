@@ -48,7 +48,7 @@ $TriggerRepeat = New-ScheduledTaskTrigger `
 $Triggers = @($TriggerLogon, $TriggerRepeat)
 
 $Settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit  (New-TimeSpan -Minutes 5) `
+    -ExecutionTimeLimit  (New-TimeSpan -Minutes 10) `
     -RestartCount        2 `
     -RestartInterval     (New-TimeSpan -Minutes 1) `
     -StartWhenAvailable `

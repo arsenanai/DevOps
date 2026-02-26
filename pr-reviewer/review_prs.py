@@ -18,7 +18,6 @@ Logs:    stdout / reviewer.log (when run via Task Scheduler)
 import base64
 import json
 import os
-import re
 import shutil
 import smtplib
 import subprocess
@@ -49,50 +48,85 @@ MD_FILES_TO_SCAN = [
 MAX_MD_FILE_CHARS = 8_000    # per file — trim before injecting
 MAX_TOTAL_MD_CHARS = 24_000  # total across all files in one repo
 
-GENERIC_SYSTEM_PROMPT = """\
-You are an expert code reviewer. Review pull request diffs and provide concise, actionable feedback.
+# ---------------------------------------------------------------------------
+# Prompt templates  ← all bot language lives here; edit freely
+# ---------------------------------------------------------------------------
 
-## General Review Criteria
+SYSTEM_PROMPT = """\
+You are an expert code reviewer. Analyse the PR diff and output ONLY a valid JSON array of issues.
 
-### Security
-- Never interpolate user input directly into raw SQL — always use parameterized queries
-- Validate and sanitize user-provided data at system boundaries
-- No hardcoded credentials, secrets, or API keys in code
+## Output rules
+- Output ONLY raw JSON — no prose, no markdown fences, no explanation before or after.
+- Each element must have exactly these keys:
+  "file"     — path relative to repo root (string)
+  "line"     — absolute line number in the NEW version of the file where the issue appears (integer)
+  "severity" — "critical" or "major" (string)
+  "message"  — short description of the issue, max 250 chars (string)
+- Only include issues you can tie to a specific line in the diff. Skip anything you cannot pin to a line.
+- Output [] if there is nothing to report.
 
-### Architecture & Code Quality
-- Business logic belongs in service/use-case classes, not in controllers or route handlers
-- Functions and classes should have single, clear responsibility
-- New public endpoints and non-trivial business logic should have tests
-- Follow the project's existing naming and structural conventions
+## Severity definitions
+- "critical": security vulnerability (SQL injection, exposed secrets, auth bypass), correctness bug,
+  or data-loss risk that was **introduced by this PR**. Must be addressed.
+- "major": meaningful architectural violation (business logic in controller, significant duplication),
+  missing required tests for a new public endpoint, or a change that appears unrelated to the PR's
+  stated purpose (flag the out-of-scope file/line with a note explaining the apparent scope mismatch).
 
-### Pull Request Hygiene
-- PR title should follow Conventional Commits: `type(scope): description`
-- PR should include a description and link to the related issue/ticket
+## Do NOT report
+- PR title or description format issues
+- Minor style, naming, or formatting preferences
+- Code that existed before this PR and was not modified
+- Vague suggestions without a specific line to attach them to
 
 ## Project Context
 
 {repo_context}
 
-## Review Format
-
-Write a concise review in Markdown with these four sections:
-
-### Summary
-1–2 sentences describing what the PR does.
-
-### Critical Issues
-Security vulnerabilities, correctness bugs, or data-loss risks — must be fixed before merge.
-If none: write "None."
-
-### Improvements
-Architecture violations, missing tests, code quality issues — should be addressed.
-If none: write "None."
-
-### Positives
-What was done well. Always include at least one positive observation.
-
-Reference specific file names and line context where relevant. Be professional and constructive.\
+## Output example
+[
+  {{"file": "app/Http/Controllers/FooController.php", "line": 42, "severity": "critical", "message": "SQL injection: $locale is interpolated directly into whereRaw() — validate against ['en','ru','kk'] allowlist before use"}},
+  {{"file": "app/Services/BarService.php", "line": 87, "severity": "major", "message": "identical pagination logic duplicated from FooService:34 — extract to shared base class"}}
+]\
 """
+
+# Prepended to every claude invocation when a local repo path is set.
+READONLY_NOTICE = (
+    "STRICT REQUIREMENT: You are operating in READ-ONLY mode. "
+    "You MUST NOT create, modify, or delete any files in the repository under any circumstances. "
+    "Do not use any file-writing, editing, or shell-execution tools. "
+    "Your sole task is to analyse the PR diff and return a JSON array as instructed.\n\n"
+)
+
+# Header injected before existing PR comments on a re-review.
+PRIOR_COMMENTS_PREAMBLE = (
+    "## Existing PR Discussion\n\n"
+    "The comments below are from the PR timeline, including a previous automated review "
+    "and teammate responses. You MUST follow these rules strictly:\n\n"
+    "1. **Pre-existing issues**: If a teammate states that something was already in production "
+    "or existed before this PR, do NOT flag it. It is out of scope.\n"
+    "2. **Factual corrections**: If a teammate corrects a previous finding as wrong, "
+    "accept the correction and drop the finding entirely.\n"
+    "3. **Out-of-scope items**: If a teammate explains something is intentional or tracked "
+    "separately, do not re-raise it.\n"
+    "4. **Focus**: Only raise issues that are genuinely new in the latest diff AND have not "
+    "already been addressed or explained by the team.\n\n"
+    "Repeating already-disputed findings is worse than missing a real issue.\n\n"
+)
+
+# User-turn content sent to claude for a first review.
+# Placeholders: {pr_title}, {diff}
+NEW_REVIEW_USER_PROMPT = (
+    "Review this PR and output the JSON array: **{pr_title}**\n\n"
+    "```diff\n{diff}\n```"
+)
+
+# User-turn content sent to claude for a re-review.
+# Placeholders: {pr_title}, {prior_ctx}, {diff}
+RE_REVIEW_USER_PROMPT = (
+    "New commits were pushed. Output an updated JSON array for: **{pr_title}**\n\n"
+    "{prior_ctx}"
+    "## Current Full Diff\n\n```diff\n{diff}\n```"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -170,9 +204,11 @@ def fetch_md_file(repo: str, path: str) -> tuple[str, str] | None:
 
 def get_pr_all_comments(repo: str, pr_number: int) -> list[dict]:
     """
-    Fetch all PR comments (timeline comments + formal review bodies).
+    Fetch all PR comments: timeline comments, formal review bodies, and
+    inline review thread comments (via REST API).
     Returns [{author, body, at}] sorted chronologically.
     """
+    # Timeline comments + formal review bodies
     output = run_gh(
         "pr", "view", str(pr_number),
         "--repo", repo,
@@ -199,6 +235,24 @@ def get_pr_all_comments(repo: str, pr_number: int) -> list[dict]:
                 "at": r.get("submittedAt", ""),
             })
 
+    # Inline review thread comments — separate REST endpoint
+    # (gh pr view does not expose these via --json)
+    try:
+        inline_output = run_gh("api", f"repos/{repo}/pulls/{pr_number}/comments")
+        for c in json.loads(inline_output):
+            body = (c.get("body") or "").strip()
+            if body:
+                path = c.get("path", "")
+                line = c.get("line") or c.get("original_line", "")
+                location = f"`{path}`" + (f":{line}" if line else "")
+                items.append({
+                    "author": (c.get("user") or {}).get("login", "unknown"),
+                    "body": f"[inline comment on {location}]\n{body}",
+                    "at": c.get("created_at", ""),
+                })
+    except Exception as e:
+        print(f"    Warning: could not fetch inline review comments: {e}", file=sys.stderr)
+
     items.sort(key=lambda x: x.get("at", ""))
     return items
 
@@ -219,6 +273,39 @@ def get_recently_merged_prs(repo: str) -> list[dict]:
         if pr.get("mergedAt")
         and datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")) > cutoff
     ]
+
+
+def is_already_blocked_by_changes_request(repo: str, pr_number: int) -> bool:
+    """
+    Return True if the PR already has a CHANGES_REQUESTED review that is newer
+    than the most recent commit — meaning the block is still active and the
+    author has already been notified, so no additional email is needed.
+    """
+    output = run_gh(
+        "pr", "view", str(pr_number),
+        "--repo", repo,
+        "--json", "reviews,commits",
+    )
+    data = json.loads(output)
+
+    changes_requested_times = [
+        r["submittedAt"] for r in data.get("reviews", [])
+        if r.get("state") == "CHANGES_REQUESTED" and r.get("submittedAt")
+    ]
+    if not changes_requested_times:
+        return False
+
+    latest_request = max(changes_requested_times)
+
+    commit_times = [
+        c.get("committedDate") or c.get("authoredDate", "")
+        for c in data.get("commits", [])
+    ]
+    commit_times = [t for t in commit_times if t]
+    if not commit_times:
+        return False
+
+    return latest_request > max(commit_times)
 
 
 def has_team_approval(repo: str, pr_number: int, pr_author: str) -> bool:
@@ -294,24 +381,137 @@ def gather_repo_context(repo: str, repo_config: dict) -> str:
 
 def build_system_prompt(repo: str, repo_config: dict) -> str:
     context = gather_repo_context(repo, repo_config)
-    return GENERIC_SYSTEM_PROMPT.format(repo_context=context)
+    return SYSTEM_PROMPT.format(repo_context=context)
 
 
 # ---------------------------------------------------------------------------
 # Review helpers
 # ---------------------------------------------------------------------------
 
-def extract_critical_issues_flag(review_text: str) -> bool:
-    """Return True if the Critical Issues section contains actual issues."""
-    match = re.search(
-        r"###\s+Critical Issues\s*\n+(.*?)(?=###|\Z)",
-        review_text,
-        re.DOTALL | re.IGNORECASE,
-    )
-    if not match:
-        return False
-    content = match.group(1).strip()
-    return content.lower() not in ("none.", "none")
+def parse_review_comments(raw: str) -> list[dict]:
+    """
+    Parse Claude's JSON output into a list of comment dicts.
+    Strips accidental markdown fences. Returns [] on any parse error.
+    Each valid entry has: file (str), line (int), severity (str), message (str).
+    """
+    text = raw.strip()
+    # Strip optional ```json ... ``` or ``` ... ``` fences
+    if text.startswith("```"):
+        lines = text.splitlines()
+        text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        print(f"    Warning: could not parse review JSON: {e}", file=sys.stderr)
+        return []
+    if not isinstance(data, list):
+        print("    Warning: review JSON is not an array, ignoring.", file=sys.stderr)
+        return []
+    valid = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            valid.append({
+                "file": str(item["file"]),
+                "line": int(item["line"]),
+                "severity": str(item.get("severity", "major")),
+                "message": str(item["message"]),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+    return valid
+
+
+def has_critical_issues(comments: list[dict]) -> bool:
+    """Return True if any comment has severity 'critical'."""
+    return any(c.get("severity") == "critical" for c in comments)
+
+
+def post_inline_review(
+    repo: str,
+    pr_number: int,
+    comments: list[dict],
+    request_changes: bool = False,
+) -> int:
+    """
+    Post inline review comments via GitHub Pull Request Reviews API.
+    Uses event=REQUEST_CHANGES when request_changes=True (blocks the PR),
+    otherwise event=COMMENT.
+    Falls back to a regular PR comment for any line not in the diff.
+    Returns count of successfully posted inline comments.
+    """
+    if not comments:
+        return 0
+
+    event = "REQUEST_CHANGES" if request_changes else "COMMENT"
+    review_body = "⚠️ Critical issues found — changes required before this PR can be merged." if request_changes else ""
+
+    review_comments = [
+        {
+            "path": c["file"],
+            "line": c["line"],
+            "side": "RIGHT",
+            "body": f"[AI] ({c['severity']}) {c['message']}",
+        }
+        for c in comments
+    ]
+
+    def gh_post_review(batch: list[dict], ev: str = event, body: str = review_body) -> None:
+        payload: dict = {"event": ev, "comments": batch}
+        if body:
+            payload["body"] = body
+        result = subprocess.run(
+            ["gh", "api", f"repos/{repo}/pulls/{pr_number}/reviews",
+             "--method", "POST", "--input", "-"],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode, "gh api", output=result.stdout, stderr=result.stderr
+            )
+
+    # Attempt 1: post all inline comments at once with the appropriate event
+    try:
+        gh_post_review(review_comments)
+        return len(review_comments)
+    except subprocess.CalledProcessError:
+        pass  # fall through to per-comment retry
+
+    # Attempt 2: post each comment individually with COMMENT event
+    posted = 0
+    failed: list[dict] = []
+    for rc, c in zip(review_comments, comments):
+        try:
+            gh_post_review([rc], ev="COMMENT", body="")
+            posted += 1
+        except subprocess.CalledProcessError:
+            failed.append(c)
+
+    # If blocking was requested but the batch failed, post a standalone
+    # REQUEST_CHANGES review (body only) so the PR is still blocked.
+    if request_changes:
+        try:
+            gh_post_review([], ev="REQUEST_CHANGES", body=review_body)
+        except subprocess.CalledProcessError as e:
+            print(f"    Warning: could not post REQUEST_CHANGES review: {e}", file=sys.stderr)
+
+    # Fallback: post failures as a regular PR comment so nothing is silently dropped
+    if failed:
+        lines = ["**AI review — could not attach inline (line not in diff):**\n"]
+        for c in failed:
+            lines.append(f"- [AI] `({c['severity']})` `{c['file']}:{c['line']}` — {c['message']}")
+        fallback_body = "\n".join(lines)
+        try:
+            post_comment(repo, pr_number, fallback_body)
+        except Exception as e:
+            print(f"    Warning: fallback comment post failed: {e}", file=sys.stderr)
+
+    return posted
 
 
 def find_pr_previous_state(state: dict, repo: str, pr_number: int) -> dict | None:
@@ -336,13 +536,7 @@ def build_prior_comments_context(comments: list[dict]) -> str:
     """
     if not comments:
         return ""
-    lines = [
-        "## Existing PR Comments\n\n",
-        "The following comments are already on this PR. "
-        "Some are from a previous automated AI review; others may be teammate corrections or feedback. "
-        "**If any teammate has disputed or corrected a previous AI finding, do not repeat that mistake.** "
-        "Focus your updated review on issues remaining or introduced in the latest commits.\n\n",
-    ]
+    lines = [PRIOR_COMMENTS_PREAMBLE]
     total = 0
     for c in comments:
         entry = f"**@{c['author']}:**\n{c['body']}\n\n---\n\n"
@@ -365,11 +559,36 @@ def find_claude_cmd() -> str:
     )
 
 
+def sync_local_repo_to_dev(local_path: str) -> None:
+    """
+    Fetch and switch the local clone to the latest 'dev' branch.
+    Raises RuntimeError if the git operations fail.
+    """
+    def git(*args: str) -> None:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=local_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git {' '.join(args)} failed: {(result.stderr or result.stdout).strip()}"
+            )
+
+    git("fetch", "--all", "--prune")
+    git("checkout", "dev")
+    git("pull", "--ff-only", "origin", "dev")
+
+
 def call_claude(
     system: str,
     pr_title: str,
     diff: str,
     prior_comments: list[dict] | None = None,
+    local_path: str | None = None,
 ) -> str:
     diff_lines = diff.splitlines()
     truncated = len(diff_lines) > MAX_DIFF_LINES
@@ -383,21 +602,18 @@ def call_claude(
     prior_ctx = build_prior_comments_context(prior_comments) if prior_comments else ""
 
     if is_re_review:
-        user_content = (
-            f"New commits were pushed to this PR. "
-            f"Please provide an **updated review** for: **{pr_title}**\n\n"
-            + prior_ctx
-            + f"## Current Full Diff\n\n```diff\n{diff_text}\n```"
+        user_content = RE_REVIEW_USER_PROMPT.format(
+            pr_title=pr_title, prior_ctx=prior_ctx, diff=diff_text
         )
     else:
-        user_content = (
-            f"Please review this PR: **{pr_title}**\n\n"
-            f"```diff\n{diff_text}\n```"
-        )
+        user_content = NEW_REVIEW_USER_PROMPT.format(pr_title=pr_title, diff=diff_text)
 
     # Combine system instructions + user content into a single prompt for the CLI.
     # Sent via stdin to avoid Windows command-line length limits.
-    full_prompt = f"{system}\n\n---\n\n{user_content}"
+    full_prompt = f"{READONLY_NOTICE}{system}\n\n---\n\n{user_content}"
+
+    if local_path:
+        sync_local_repo_to_dev(local_path)
 
     claude = find_claude_cmd()
     result = subprocess.run(
@@ -406,8 +622,9 @@ def call_claude(
         capture_output=True,
         text=True,
         encoding="utf-8",
-        timeout=120,
+        timeout=None,
         creationflags=subprocess.CREATE_NO_WINDOW,
+        cwd=local_path or None,
     )
     if result.returncode != 0:
         stderr = (result.stderr or "").strip()
@@ -416,23 +633,6 @@ def call_claude(
     if not output:
         raise RuntimeError("claude CLI returned an empty response")
     return output
-
-
-def format_comment(author: str, review: str, is_re_review: bool = False) -> str:
-    label = "Updated AI Code Review" if is_re_review else "AI Code Review"
-    update_note = (
-        "\n> ℹ️ This is an updated review following new commits pushed to this PR.\n"
-        if is_re_review
-        else ""
-    )
-    return (
-        f"@{author} please have a look at this review made by AI, it may contain mistakes, "
-        f"so that it's not blocking your changes from being merged, just for you to be aware of:\n\n"
-        f"---\n\n"
-        f"## {label}\n"
-        f"{update_note}\n"
-        f"{review}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +652,101 @@ def send_email_alert(smtp_config: dict, subject: str, body_html: str) -> None:
         server.starttls()
         server.login(smtp_config["username"], smtp_config["password"])
         server.send_message(msg)
+
+
+def send_clean_review_alert(
+    smtp_config: dict,
+    repo: str,
+    pr_number: int,
+    title: str,
+    author: str,
+    is_re_review: bool,
+) -> None:
+    """Send an email when a PR review finds no issues — PR is ready to merge."""
+    pr_url = f"https://github.com/{repo}/pull/{pr_number}"
+    review_label = "Re-review (issues resolved)" if is_re_review else "New Review"
+    subject = f"[PR Ready to Merge] {repo} #{pr_number} — {title}"
+    body_html = f"""\
+<!DOCTYPE html>
+<html>
+<body style="font-family:sans-serif;max-width:680px;margin:auto;padding:24px">
+  <h2 style="color:#27ae60">&#9989; PR Ready to Merge</h2>
+  <table cellpadding="8" style="border-collapse:collapse;width:100%">
+    <tr style="background:#f8f8f8">
+      <td><b>Repository</b></td><td>{repo}</td>
+    </tr>
+    <tr>
+      <td><b>PR</b></td>
+      <td><a href="{pr_url}">#{pr_number} &mdash; {title}</a></td>
+    </tr>
+    <tr style="background:#f8f8f8">
+      <td><b>Author</b></td><td>@{author}</td>
+    </tr>
+    <tr>
+      <td><b>Review type</b></td><td>{review_label}</td>
+    </tr>
+  </table>
+  <p style="margin-top:20px">The automated AI code review found <strong>no issues</strong>. The PR looks good to merge.</p>
+  <p>
+    <a href="{pr_url}" style="background:#27ae60;color:#fff;padding:8px 16px;
+      text-decoration:none;border-radius:4px">View PR on GitHub &rarr;</a>
+  </p>
+</body>
+</html>"""
+    send_email_alert(smtp_config, subject, body_html)
+
+
+def send_critical_issues_alert(
+    smtp_config: dict,
+    repo: str,
+    pr_number: int,
+    title: str,
+    author: str,
+    comments: list[dict],
+    is_re_review: bool,
+) -> None:
+    """Send an immediate email alert when a PR review finds critical issues."""
+    pr_url = f"https://github.com/{repo}/pull/{pr_number}"
+    critical = [c for c in comments if c.get("severity") == "critical"]
+    def esc(s: str) -> str:
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    issues_html = "\n".join(
+        f"<li><code>{esc(c['file'])}:{c['line']}</code> — {esc(c['message'])}</li>"
+        for c in critical
+    )
+    review_label = "Updated Review" if is_re_review else "New Review"
+    subject = f"[PR Critical Issues] {repo} #{pr_number} — {title}"
+    body_html = f"""\
+<!DOCTYPE html>
+<html>
+<body style="font-family:sans-serif;max-width:680px;margin:auto;padding:24px">
+  <h2 style="color:#c0392b">&#9888;&#65039; Critical Issues Found in PR</h2>
+  <table cellpadding="8" style="border-collapse:collapse;width:100%">
+    <tr style="background:#f8f8f8">
+      <td><b>Repository</b></td><td>{repo}</td>
+    </tr>
+    <tr>
+      <td><b>PR</b></td>
+      <td><a href="{pr_url}">#{pr_number} &mdash; {title}</a></td>
+    </tr>
+    <tr style="background:#f8f8f8">
+      <td><b>Author</b></td><td>@{author}</td>
+    </tr>
+    <tr>
+      <td><b>Review type</b></td><td>{review_label}</td>
+    </tr>
+  </table>
+  <h3 style="margin-top:20px">Critical Issues</h3>
+  <ul style="background:#fff8f8;border-left:4px solid #c0392b;padding:12px 16px 12px 32px;font-size:14px">
+    {issues_html}
+  </ul>
+  <p style="margin-top:20px">
+    <a href="{pr_url}" style="background:#2980b9;color:#fff;padding:8px 16px;
+      text-decoration:none;border-radius:4px">View PR on GitHub &rarr;</a>
+  </p>
+</body>
+</html>"""
+    send_email_alert(smtp_config, subject, body_html)
 
 
 def check_merged_prs(config: dict, state: dict) -> None:
@@ -593,11 +888,122 @@ def check_merged_prs(config: dict, state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CLI: reset-review
+# ---------------------------------------------------------------------------
+
+def cmd_reset_review() -> None:
+    """
+    Subcommand: reset-review
+
+    Usage:
+      python review_prs.py reset-review --all
+          Remove the latest review entry for every tracked PR (triggers re-review
+          on the next run).
+
+      python review_prs.py reset-review REPO#PR
+          Remove the latest review entry for a specific PR.
+          Example: python review_prs.py reset-review org/repo#123
+
+      python review_prs.py reset-review REPO#PR SHA
+          Remove a specific review entry identified by its commit SHA (full or
+          short prefix).
+          Example: python review_prs.py reset-review org/repo#123 f8f9277
+    """
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+    raw_args = sys.argv[2:]
+
+    if not raw_args:
+        print(__doc__ if False else cmd_reset_review.__doc__)
+        sys.exit(1)
+
+    state = load_state()
+
+    # ── --all mode ──────────────────────────────────────────────────────────
+    if raw_args[0] == "--all":
+        # For each PR (keyed by "repo#number"), collect the latest review entry.
+        pr_best: dict[str, tuple[str, str]] = {}  # pr_id -> (full_key, reviewed_at)
+        for k, v in state.items():
+            if k.endswith(":merged") or v.get("skipped"):
+                continue
+            pr_id = k.rsplit(":", 1)[0]  # "repo#number"
+            reviewed_at = v.get("reviewed_at", "")
+            if pr_id not in pr_best or reviewed_at > pr_best[pr_id][1]:
+                pr_best[pr_id] = (k, reviewed_at)
+
+        if not pr_best:
+            print("No review entries found in state.")
+            sys.exit(0)
+
+        for full_key, _ in pr_best.values():
+            del state[full_key]
+        save_state(state)
+
+        print(f"Removed {len(pr_best)} latest review entry(ies):")
+        for full_key, reviewed_at in pr_best.values():
+            print(f"  {full_key}  (reviewed_at: {reviewed_at})")
+        return
+
+    # ── REPO#PR mode ────────────────────────────────────────────────────────
+    pr_spec = raw_args[0]
+    sha_prefix = raw_args[1] if len(raw_args) > 1 else None
+
+    if "#" not in pr_spec:
+        print(
+            f"ERROR: expected REPO#PR format (e.g. org/repo#123), got: {pr_spec!r}\n"
+            f"Run without arguments for usage help."
+        )
+        sys.exit(1)
+
+    repo, pr_num_str = pr_spec.rsplit("#", 1)
+    try:
+        pr_number = int(pr_num_str)
+    except ValueError:
+        print(f"ERROR: PR number must be an integer, got: {pr_num_str!r}")
+        sys.exit(1)
+
+    prefix = f"{repo}#{pr_number}:"
+    candidates = [
+        (k, v) for k, v in state.items()
+        if k.startswith(prefix) and not k.endswith(":merged") and not v.get("skipped")
+    ]
+
+    if not candidates:
+        print(f"No review entries found for {repo}#{pr_number}.")
+        sys.exit(1)
+
+    if sha_prefix:
+        # Find entry whose SHA starts with the given prefix.
+        matches = [
+            (k, v) for k, v in candidates
+            if k[len(prefix):].startswith(sha_prefix)
+        ]
+        if not matches:
+            print(
+                f"No review entry found for {repo}#{pr_number} with SHA starting with {sha_prefix!r}.\n"
+                f"Known entries:"
+            )
+            for k, v in candidates:
+                print(f"  {k}  (reviewed_at: {v.get('reviewed_at', '?')})")
+            sys.exit(1)
+        target_key = matches[0][0]
+    else:
+        # Remove the most recent entry.
+        target_key = max(candidates, key=lambda x: x[1].get("reviewed_at", ""))[0]
+
+    del state[target_key]
+    save_state(state)
+    print(f"Removed: {target_key}")
+    print("The PR will be re-reviewed on the next run.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 LOG_FILE = BASE_DIR / "reviewer.log"
-LOG_MAX_LINES = 100
+LOG_MAX_LINES = 150
 
 
 def rotate_log() -> None:
@@ -665,25 +1071,37 @@ def main() -> None:
             title = pr["title"]
             author = pr["author"]["login"]
 
-            # Detect re-review: same PR number reviewed before at a different SHA
+            # Detect re-review: same PR number reviewed before at a different SHA.
+            # Also handles state manually reset via reset-review — the bot's
+            # previous comment still exists on the PR even after the state entry
+            # is deleted, so we detect it by checking for the reviewer's comment.
             prev_state_entry = find_pr_previous_state(state, repo, number)
-            is_re_review = prev_state_entry is not None
 
-            prior_comments: list[dict] | None = None
+            # Always fetch existing comments for context and re-review detection.
+            prior_comments: list[dict] = []
+            try:
+                prior_comments = get_pr_all_comments(repo, number)
+            except Exception as e:
+                print(
+                    f"    PR #{number} — could not fetch prior comments: {e}",
+                    file=sys.stderr,
+                )
+
+            # is_re_review if we have a state entry (normal re-review on new
+            # commits) OR the bot already has a comment on the PR (handles
+            # manual state reset via reset-review).
+            is_re_review = prev_state_entry is not None or any(
+                c.get("author") == reviewer for c in prior_comments
+            )
+
             if is_re_review:
-                print(f"    PR #{number} — re-reviewing (new commits pushed): {title}")
-                try:
-                    prior_comments = get_pr_all_comments(repo, number)
+                reason = "new commits pushed" if prev_state_entry else "state was reset"
+                print(f"    PR #{number} — re-reviewing ({reason}): {title}")
+                if prior_comments:
                     print(
                         f"    PR #{number} — fetched {len(prior_comments)} existing "
                         f"comment(s) for context."
                     )
-                except Exception as e:
-                    print(
-                        f"    PR #{number} — could not fetch prior comments: {e}",
-                        file=sys.stderr,
-                    )
-                    prior_comments = []
             else:
                 print(f"    PR #{number} — new review: {title}")
 
@@ -700,10 +1118,78 @@ def main() -> None:
                     save_state(state)
                     continue
 
-                review = call_claude(system_prompt, title, diff, prior_comments)
-                has_issues = extract_critical_issues_flag(review)
-                comment = format_comment(author, review, is_re_review=is_re_review)
-                post_comment(repo, number, comment)
+                raw = call_claude(system_prompt, title, diff, prior_comments, repo_config.get("local_path"))
+                comments = parse_review_comments(raw)
+                is_critical = has_critical_issues(comments)
+
+                if comments:
+                    posted = post_inline_review(repo, number, comments, request_changes=is_critical)
+                    flag = " ⚠ (critical issues found — changes requested)" if is_critical else ""
+                    print(f"    PR #{number} — {posted}/{len(comments)} inline comment(s) posted.{flag} ✓")
+                else:
+                    print(f"    PR #{number} — no issues found, nothing posted. ✓")
+                    smtp_config = config.get("smtp")
+                    if smtp_config:
+                        prev_had_issues = (
+                            prev_state_entry is not None
+                            and prev_state_entry.get("has_critical_issues", False)
+                        )
+                        # Email on first clean review, or when issues were fixed
+                        if prev_state_entry is None or prev_had_issues:
+                            try:
+                                send_clean_review_alert(
+                                    smtp_config, repo, number, title, author, is_re_review,
+                                )
+                                print(f"    PR #{number} — ready-to-merge alert sent.")
+                            except Exception as e:
+                                print(
+                                    f"    PR #{number} — failed to send clean review alert: {e}",
+                                    file=sys.stderr,
+                                )
+
+                if is_critical:
+                    smtp_config = config.get("smtp")
+                    if smtp_config:
+                        # Don't re-email if the previous review already flagged
+                        # critical issues — avoids spam on successive re-reviews
+                        # of the same unresolved issues. Re-notify only if the
+                        # issues reappear after a clean review.
+                        prev_had_critical_issues = (
+                            prev_state_entry is not None
+                            and prev_state_entry.get("has_critical_issues", False)
+                        )
+                        if prev_had_critical_issues:
+                            print(
+                                f"    PR #{number} — critical issues already flagged in "
+                                f"previous review, skipping email."
+                            )
+                        else:
+                            try:
+                                blocked = is_already_blocked_by_changes_request(repo, number)
+                            except Exception as e:
+                                print(
+                                    f"    PR #{number} — could not check block status: {e}",
+                                    file=sys.stderr,
+                                )
+                                blocked = False
+
+                            if blocked:
+                                print(
+                                    f"    PR #{number} — already has an active changes-request, "
+                                    f"skipping email."
+                                )
+                            else:
+                                try:
+                                    send_critical_issues_alert(
+                                        smtp_config, repo, number, title, author,
+                                        comments, is_re_review,
+                                    )
+                                    print(f"    PR #{number} — critical issues alert sent.")
+                                except Exception as e:
+                                    print(
+                                        f"    PR #{number} — failed to send critical issues alert: {e}",
+                                        file=sys.stderr,
+                                    )
 
                 state[key] = {
                     "reviewed_at": datetime.now().isoformat(),
@@ -712,12 +1198,10 @@ def main() -> None:
                     "sha": sha,
                     "title": title,
                     "author": author,
-                    "has_critical_issues": has_issues,
+                    "has_critical_issues": is_critical,
                     "is_re_review": is_re_review,
                 }
                 total_reviewed += 1
-                flag = " ⚠ (critical issues found)" if has_issues else ""
-                print(f"    PR #{number} — review posted.{flag} ✓")
 
             except subprocess.CalledProcessError as e:
                 print(f"    PR #{number} — gh error: {e.stderr.strip()}", file=sys.stderr)
@@ -734,4 +1218,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "reset-review":
+        cmd_reset_review()
+    else:
+        main()
