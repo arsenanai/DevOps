@@ -18,6 +18,7 @@ Logs:    stdout / reviewer.log (when run via Task Scheduler)
 import base64
 import json
 import os
+import re
 import shutil
 import smtplib
 import subprocess
@@ -548,15 +549,13 @@ def build_prior_comments_context(comments: list[dict]) -> str:
     return "".join(lines)
 
 
-def find_claude_cmd() -> str:
-    """Locate the claude CLI executable (handles Windows .cmd wrapper)."""
-    for name in ("claude", "claude.cmd"):
+def find_cli(names: tuple[str, ...], label: str) -> str:
+    """Locate a CLI executable, checking multiple possible names (e.g. .cmd Windows wrapper)."""
+    for name in names:
         path = shutil.which(name)
         if path:
             return path
-    raise RuntimeError(
-        "claude CLI not found in PATH. Make sure Claude Code is installed and logged in."
-    )
+    raise RuntimeError(f"{label} not found in PATH.")
 
 
 def sync_local_repo_to_dev(local_path: str) -> None:
@@ -583,13 +582,13 @@ def sync_local_repo_to_dev(local_path: str) -> None:
     git("pull", "--ff-only", "origin", "dev")
 
 
-def call_claude(
+def _build_prompts(
     system: str,
     pr_title: str,
     diff: str,
-    prior_comments: list[dict] | None = None,
-    local_path: str | None = None,
-) -> str:
+    prior_comments: list[dict] | None,
+) -> tuple[str, str]:
+    """Return (system_prompt, user_content) ready to send to any LLM backend."""
     diff_lines = diff.splitlines()
     truncated = len(diff_lines) > MAX_DIFF_LINES
     if truncated:
@@ -598,26 +597,46 @@ def call_claude(
     if truncated:
         diff_text += f"\n\n... [diff truncated — showing first {MAX_DIFF_LINES} lines] ..."
 
-    is_re_review = bool(prior_comments)
     prior_ctx = build_prior_comments_context(prior_comments) if prior_comments else ""
-
-    if is_re_review:
+    if prior_comments:
         user_content = RE_REVIEW_USER_PROMPT.format(
             pr_title=pr_title, prior_ctx=prior_ctx, diff=diff_text
         )
     else:
         user_content = NEW_REVIEW_USER_PROMPT.format(pr_title=pr_title, diff=diff_text)
 
-    # Combine system instructions + user content into a single prompt for the CLI.
-    # Sent via stdin to avoid Windows command-line length limits.
-    full_prompt = f"{READONLY_NOTICE}{system}\n\n---\n\n{user_content}"
+    return system, user_content
+
+
+def call_claude_cli(
+    system: str,
+    pr_title: str,
+    diff: str,
+    prior_comments: list[dict] | None = None,
+    local_path: str | None = None,
+    claude_cfg: dict | None = None,
+) -> str:
+    """Call the Claude Code CLI subprocess (original backend)."""
+    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments)
+    # Only prepend READONLY_NOTICE when a local repo is provided; without local_path
+    # Claude has no file-system access anyway, so the notice just wastes tokens.
+    notice = READONLY_NOTICE if local_path else ""
+    full_prompt = f"{notice}{system_prompt}\n\n---\n\n{user_content}"
 
     if local_path:
         sync_local_repo_to_dev(local_path)
 
-    claude = find_claude_cmd()
+    cfg = claude_cfg or {}
+    # Default to Haiku — cheapest Claude model, adequate for structured JSON output.
+    model = cfg.get("model", "claude-haiku-4-5-20251001")
+
+    claude = find_cli(("claude", "claude.cmd"), "Claude Code CLI")
+    print(f"    [claude] CLI path: {claude}")
+    print(f"    [claude] model: {model}")
+    cmd = [claude, "-p", "--model", model]
+    print(f"    [claude] Running: {' '.join(cmd[:3])} ...  (stdin: {len(full_prompt)} chars, cwd: {local_path or 'inherited'})")
     result = subprocess.run(
-        [claude, "-p"],
+        cmd,
         input=full_prompt,
         capture_output=True,
         text=True,
@@ -626,13 +645,237 @@ def call_claude(
         creationflags=subprocess.CREATE_NO_WINDOW,
         cwd=local_path or None,
     )
+    print(f"    [claude] exit code: {result.returncode}")
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    if stderr:
+        print(f"    [claude] stderr ({len(stderr)} chars):\n{stderr}")
+    if stdout:
+        print(f"    [claude] stdout ({len(stdout)} chars): {stdout[:500]}"
+              + (" ... [truncated]" if len(stdout) > 500 else ""))
+    else:
+        print(f"    [claude] stdout: (empty)")
     if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
         raise RuntimeError(f"claude CLI exited with code {result.returncode}: {stderr}")
-    output = (result.stdout or "").strip()
-    if not output:
+    if not stdout:
         raise RuntimeError("claude CLI returned an empty response")
+    return stdout
+
+
+def call_ollama(
+    system: str,
+    pr_title: str,
+    diff: str,
+    ollama_cfg: dict,
+    prior_comments: list[dict] | None = None,
+) -> str:
+    """Call a local Ollama model via its REST API."""
+    import urllib.request
+
+    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments)
+    host = ollama_cfg.get("host", "http://localhost:11434").rstrip("/")
+    model = ollama_cfg["model"]
+    print(f"    [ollama] model: {model}, host: {host}")
+
+    payload_obj = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "stream": False,
+        "options": {
+            "temperature": 0.1,   # low temp = more deterministic JSON output
+            "num_ctx": 65536,     # large diffs can reach 40K+ tokens; 64K gives headroom
+        },
+    }
+    payload = json.dumps(payload_obj).encode("utf-8")
+
+    # Save full payload to a debug file so prompts can be replayed individually.
+    debug_dir = BASE_DIR / "ollama_prompts"
+    debug_dir.mkdir(exist_ok=True)
+    slug = re.sub(r"[^\w\-]", "_", pr_title)[:40]
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    debug_file = debug_dir / f"{slug}.json"
+    debug_file.write_text(json.dumps(payload_obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"    [ollama] prompt saved → {debug_file}")
+
+    print(f"    [ollama] sending request ({len(payload)} bytes, "
+          f"prompt={len(system_prompt)+len(user_content)} chars)...")
+
+    req = urllib.request.Request(
+        f"{host}/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Ollama request failed: {exc}") from exc
+
+    raw = (body.get("message", {}).get("content") or "").strip()
+    # Strip <think>...</think> blocks produced by reasoning models (e.g. qwen3-thinking).
+    # This lets the model reason internally while still returning clean JSON.
+    output = re.sub(r"<think>[\s\S]*?</think>", "", raw).strip()
+    if raw != output:
+        stripped_chars = len(raw) - len(output)
+        print(f"    [ollama] stripped {stripped_chars} chars of <think> blocks")
+    print(f"    [ollama] response ({len(output)} chars): {output[:500]}"
+          + (" ... [truncated]" if len(output) > 500 else ""))
+    if not output:
+        raise RuntimeError("Ollama returned an empty response")
     return output
+
+
+def _run_cli_subprocess(cmd: list[str], prompt: str, label: str) -> str:
+    """Run a CLI subprocess with the prompt on stdin, return stripped stdout."""
+    cmd_display = " ".join(cmd)
+    print(f"    [{label}] Running: {cmd_display}")
+    if prompt:
+        print(f"    [{label}] stdin: {len(prompt)} chars")
+    result = subprocess.run(
+        cmd,
+        input=prompt,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=None,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    print(f"    [{label}] exit code: {result.returncode}")
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    if stderr:
+        print(f"    [{label}] stderr ({len(stderr)} chars):\n{stderr}")
+    if stdout:
+        print(f"    [{label}] stdout ({len(stdout)} chars):\n{stdout[:2000]}"
+              + (" ... [truncated]" if len(stdout) > 2000 else ""))
+    else:
+        print(f"    [{label}] stdout: (empty)")
+    if result.returncode != 0:
+        raise RuntimeError(f"{label} exited with code {result.returncode}: {stderr}")
+    output = stdout
+    if not output:
+        raise RuntimeError(f"{label} returned an empty response")
+    return output
+
+
+def call_gemini_cli(
+    system: str,
+    pr_title: str,
+    diff: str,
+    prior_comments: list[dict] | None = None,
+) -> str:
+    """Call the Gemini CLI subprocess (stdin-based, same pattern as Claude CLI)."""
+    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments)
+    full_prompt = f"{READONLY_NOTICE}{system_prompt}\n\n---\n\n{user_content}"
+    gemini = find_cli(("gemini", "gemini.cmd"), "Gemini CLI")
+    print(f"    [gemini] CLI path: {gemini}")
+    return _run_cli_subprocess([gemini, "-p"], full_prompt, "gemini CLI")
+
+
+def call_opencode(
+    system: str,
+    pr_title: str,
+    diff: str,
+    opencode_cfg: dict | None = None,
+    prior_comments: list[dict] | None = None,
+) -> str:
+    """Call the OpenCode CLI via `opencode run <message>`."""
+    import tempfile
+    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments)
+    full_prompt = f"{READONLY_NOTICE}{system_prompt}\n\n---\n\n{user_content}"
+    oc = find_cli(("opencode", "opencode.cmd"), "OpenCode CLI")
+    print(f"    [opencode] CLI path: {oc}")
+    cfg = opencode_cfg or {}
+    # Windows limits command-line length to ~32 KB, so the full prompt can't be
+    # passed as an argument. Write it to a temp file and attach with --file.
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".md", encoding="utf-8", delete=False)
+    try:
+        tmp.write(full_prompt)
+        tmp.close()
+        print(f"    [opencode] prompt temp file: {tmp.name} ({len(full_prompt)} chars)")
+        cmd = [
+            oc, "run",
+            "Follow the instructions in the attached file exactly. "
+            "Output ONLY the raw JSON array, nothing else.",
+            "--file", tmp.name,
+        ]
+        if cfg.get("model"):
+            cmd.extend(["--model", cfg["model"]])
+            print(f"    [opencode] model override: {cfg['model']}")
+        raw = _run_cli_subprocess(cmd, "", "opencode CLI")
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+    # opencode prepends a session header line (e.g. "> build · session-name").
+    # Strip those lines so the JSON parser only sees the LLM response.
+    lines_before = raw.splitlines()
+    lines = [ln for ln in lines_before if not ln.lstrip().startswith(">")]
+    stripped = "\n".join(lines).strip()
+    removed = len(lines_before) - len(lines)
+    if removed:
+        print(f"    [opencode] stripped {removed} header line(s) starting with '>'")
+    print(f"    [opencode] response after strip ({len(stripped)} chars): {stripped[:500]}"
+          + (" ... [truncated]" if len(stripped) > 500 else ""))
+    return stripped
+
+
+def call_aider(
+    system: str,
+    pr_title: str,
+    diff: str,
+    aider_cfg: dict | None = None,
+    prior_comments: list[dict] | None = None,
+) -> str:
+    """Call Aider in non-interactive mode for code review (no files, no git edits)."""
+    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments)
+    full_prompt = f"{system_prompt}\n\n---\n\n{user_content}"
+    cfg = aider_cfg or {}
+    aider = find_cli(("aider", "aider.cmd"), "Aider")
+    cmd = [aider, "--message", full_prompt, "--yes-always", "--no-git", "--no-auto-commits"]
+    if cfg.get("model"):
+        cmd.extend(["--model", cfg["model"]])
+    return _run_cli_subprocess(cmd, "", "aider")
+
+
+def call_llm(
+    config: dict,
+    system: str,
+    pr_title: str,
+    diff: str,
+    prior_comments: list[dict] | None = None,
+    local_path: str | None = None,
+) -> str:
+    """Dispatch to the configured LLM backend."""
+    llm_cfg = config.get("llm", {})
+    backend = llm_cfg.get("backend", "opencode")
+    print(f"    [llm] backend: {backend}")
+
+    if backend == "ollama":
+        ollama_cfg = llm_cfg.get("ollama", {})
+        if not ollama_cfg.get("model"):
+            raise RuntimeError("config.json: llm.ollama.model is required when backend=ollama")
+        return call_ollama(system, pr_title, diff, ollama_cfg, prior_comments)
+
+    if backend == "gemini":
+        return call_gemini_cli(system, pr_title, diff, prior_comments)
+
+    if backend == "opencode":
+        opencode_cfg = llm_cfg.get("opencode", {})
+        return call_opencode(system, pr_title, diff, opencode_cfg, prior_comments)
+
+    if backend == "aider":
+        aider_cfg = llm_cfg.get("aider", {})
+        return call_aider(system, pr_title, diff, aider_cfg, prior_comments)
+
+    # Fallback / explicit: claude CLI
+    claude_cfg = llm_cfg.get("claude", {})
+    return call_claude_cli(system, pr_title, diff, prior_comments, local_path, claude_cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -1003,7 +1246,7 @@ def cmd_reset_review() -> None:
 # ---------------------------------------------------------------------------
 
 LOG_FILE = BASE_DIR / "reviewer.log"
-LOG_MAX_LINES = 150
+LOG_MAX_LINES = 500
 
 
 def rotate_log() -> None:
@@ -1023,9 +1266,11 @@ def main() -> None:
         _log = open(LOG_FILE, "a", encoding="utf-8")
         sys.stdout = sys.stderr = _log
     else:
-        # Console mode (manual run / old bat): ensure UTF-8 so emoji chars don't crash.
+        # Console mode (manual run): ensure UTF-8 so emoji chars don't crash.
+        # NOTE: console mode does NOT write to reviewer.log — output goes to terminal only.
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        print(f"[NOTE] Running in console mode — output is NOT written to {LOG_FILE}")
 
     config = load_config()
     reviewer = config["reviewer_username"]
@@ -1118,7 +1363,7 @@ def main() -> None:
                     save_state(state)
                     continue
 
-                raw = call_claude(system_prompt, title, diff, prior_comments, repo_config.get("local_path"))
+                raw = call_llm(config, system_prompt, title, diff, prior_comments, repo_config.get("local_path"))
                 comments = parse_review_comments(raw)
                 is_critical = has_critical_issues(comments)
 

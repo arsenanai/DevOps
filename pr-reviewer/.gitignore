@@ -6,3 +6,4 @@ run_reviewer.bat
 reviewed_prs.json
 reviewer.log
 __pycache__
+ollama_prompts

@@ -1,5 +1,20 @@
 {
   "reviewer_username": "github_username",
+  "llm": {
+    "backend": "opencode",
+    "_comment_backend": "Backends: 'opencode' (default), 'claude', 'gemini', 'ollama', 'aider'.",
+    "claude": {
+      "model": "claude-haiku-4-5-20251001",
+      "_comment_model": "Haiku is cheapest; use claude-sonnet-4-6 for higher quality"
+    },
+    "ollama": {
+      "model": "qwen2.5-coder:7b",
+      "host": "http://localhost:11434"
+    },
+    "aider": {
+      "model": ""
+    }
+  },
   "smtp": {
     "host": "smtp.mail.com",
     "port": 587,

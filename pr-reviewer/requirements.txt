@@ -1,1 +1,2 @@
-# No Python dependencies — uses claude CLI (Claude Code) and gh CLI directly.
+# No third-party dependencies for the claude backend (uses claude CLI and gh CLI directly).
+# For the ollama backend, urllib.request from the standard library is used — no extra install needed.

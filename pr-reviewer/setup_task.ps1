@@ -1,7 +1,7 @@
 # setup_task.ps1
 # Registers a Windows Task Scheduler task that runs the PR reviewer:
 #   - immediately on every user logon
-#   - then every 15 minutes while logged in
+#   - then every 1 hour while logged in
 # Run once from PowerShell (no Administrator needed for current-user tasks).
 #
 # Usage:
@@ -39,11 +39,11 @@ $TriggerLogon = New-ScheduledTaskTrigger `
     -AtLogOn `
     -User $env:USERNAME
 
-# Trigger 2: repeat every 15 minutes while logged in
+# Trigger 2: repeat every 1 Hour while logged in
 $TriggerRepeat = New-ScheduledTaskTrigger `
     -Once `
     -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 15)
+    -RepetitionInterval (New-TimeSpan -Hours 1)
 
 $Triggers = @($TriggerLogon, $TriggerRepeat)
 
@@ -74,7 +74,7 @@ if ($Existing) {
 }
 
 Write-Host ""
-Write-Host "All done. The reviewer runs on logon + every 15 minutes."
+Write-Host "All done. The reviewer runs on logon + every 1 hour."
 Write-Host "  Logs  : $LogFile"
 Write-Host "  State : $(Join-Path $ScriptDir 'reviewed_prs.json')"
 Write-Host "  Config: $(Join-Path $ScriptDir 'config.json')"
