@@ -96,8 +96,8 @@ You are an expert code reviewer. Analyse the PR diff and output ONLY a valid JSO
 # Prepended to every claude invocation when a local repo path is set.
 READONLY_NOTICE = (
     "You have READ-ONLY access to the local repository. "
-    "You are ENCOURAGED to read any files you need to understand the codebase and validate the diff — "
-    "use your file-reading tools freely to explore related code, tests, configs, or documentation. "
+    "Start by reading the documentation files listed in ## Project Context, then read any other "
+    "files you need to validate the diff (related code, tests, configs). "
     "You MUST NOT create, modify, or delete any files under any circumstances. "
     "When you have gathered enough context, output the JSON array as instructed and nothing else.\n\n"
 )
@@ -339,13 +339,39 @@ def has_team_approval(repo: str, pr_number: int, pr_author: str) -> bool:
 # Repo context (documentation)
 # ---------------------------------------------------------------------------
 
-def gather_repo_context(repo: str, repo_config: dict) -> str:
+def gather_repo_context(repo: str, repo_config: dict, local_path: str | None = None) -> str:
     """
-    Fetch documentation MD files from the repo and build a context block
-    for the system prompt. Enforces per-file and total character budgets.
-    Falls back to a generic notice if no files are found.
+    Build a context block for the system prompt.
+
+    - With local_path: lists available doc files only — Claude reads them via file tools.
+      This keeps the initial prompt light; content is loaded lazily as Claude explores.
+    - Without local_path: fetches and embeds file contents from the GitHub API
+      (original behaviour, used when Claude has no filesystem access).
     """
     name = repo_config.get("name", repo)
+
+    if local_path:
+        # Claude has direct filesystem access — list available docs, don't embed content.
+        available = [
+            md_path for md_path in MD_FILES_TO_SCAN
+            if (Path(local_path) / md_path).exists()
+        ]
+        if available:
+            files_list = "\n".join(f"- `{p}`" for p in available)
+            return (
+                f"**Project:** {name} (`{repo}`)\n\n"
+                f"The following documentation files are present in the repository root. "
+                f"Read them to learn project conventions, architecture decisions, and rules "
+                f"before reviewing the diff:\n\n"
+                f"{files_list}"
+            )
+        return (
+            f"**Project:** {name} (`{repo}`)\n\n"
+            "No documentation files found in the repository. "
+            "Apply general best practices for the detected tech stack and language."
+        )
+
+    # No local repo access — fetch and embed content from the GitHub API.
     found: list[tuple[str, str]] = []
     total_chars = 0
 
@@ -388,8 +414,8 @@ def gather_repo_context(repo: str, repo_config: dict) -> str:
     return header + "\n\n" + "\n\n".join(sections)
 
 
-def build_system_prompt(repo: str, repo_config: dict) -> str:
-    context = gather_repo_context(repo, repo_config)
+def build_system_prompt(repo: str, repo_config: dict, local_path: str | None = None) -> str:
+    context = gather_repo_context(repo, repo_config, local_path)
     return SYSTEM_PROMPT.format(repo_context=context)
 
 
@@ -1413,8 +1439,12 @@ def main(dry_run: bool = False) -> None:
             continue
 
         print(f"  [{repo}] Found {len(prs)} PR(s) requesting review from @{reviewer}.")
-        print(f"  [{repo}] Fetching repo documentation ({', '.join(MD_FILES_TO_SCAN)})...")
-        system_prompt = build_system_prompt(repo, repo_config)
+        local_path = repo_config.get("local_path")
+        if local_path:
+            print(f"  [{repo}] Scanning local docs ({', '.join(MD_FILES_TO_SCAN)})...")
+        else:
+            print(f"  [{repo}] Fetching repo documentation ({', '.join(MD_FILES_TO_SCAN)})...")
+        system_prompt = build_system_prompt(repo, repo_config, local_path)
 
         for pr in prs:
             number = pr["number"]
@@ -1482,7 +1512,7 @@ def main(dry_run: bool = False) -> None:
                     print(f"    PR #{number} — [dry-run] prompt saved to {PROMPTS_DIR.name}/. Skipping LLM call.")
                     continue
 
-                raw = call_llm(config, system_prompt, title, diff, prior_comments, repo_config.get("local_path"), body)
+                raw = call_llm(config, system_prompt, title, diff, prior_comments, local_path, body)
                 comments = parse_review_comments(raw)
                 is_critical = has_critical_issues(comments)
 
