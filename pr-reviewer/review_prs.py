@@ -31,9 +31,12 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "config.json"
 STATE_FILE = BASE_DIR / "reviewed_prs.json"
+PROMPTS_DIR = BASE_DIR / "llm_prompts"
+MAX_PROMPT_FILES = 10
 
 MAX_DIFF_LINES = 3_000
 MAX_COMMENTS_CHARS = 6_000      # prior PR comments injected into re-review prompt
+MAX_PR_BODY_CHARS = 2_000       # PR description injected into every review prompt
 MERGED_PR_LOOKBACK_HOURS = 25   # window for scanning recently-merged PRs
 
 # Documentation files to fetch from each repo, in priority order.
@@ -62,7 +65,7 @@ You are an expert code reviewer. Analyse the PR diff and output ONLY a valid JSO
   "file"     — path relative to repo root (string)
   "line"     — absolute line number in the NEW version of the file where the issue appears (integer)
   "severity" — "critical" or "major" (string)
-  "message"  — short description of the issue, max 250 chars (string)
+  "message"  — description of the issue, max 500 chars (string)
 - Only include issues you can tie to a specific line in the diff. Skip anything you cannot pin to a line.
 - Output [] if there is nothing to report.
 
@@ -92,10 +95,11 @@ You are an expert code reviewer. Analyse the PR diff and output ONLY a valid JSO
 
 # Prepended to every claude invocation when a local repo path is set.
 READONLY_NOTICE = (
-    "STRICT REQUIREMENT: You are operating in READ-ONLY mode. "
-    "You MUST NOT create, modify, or delete any files in the repository under any circumstances. "
-    "Do not use any file-writing, editing, or shell-execution tools. "
-    "Your sole task is to analyse the PR diff and return a JSON array as instructed.\n\n"
+    "You have READ-ONLY access to the local repository. "
+    "You are ENCOURAGED to read any files you need to understand the codebase and validate the diff — "
+    "use your file-reading tools freely to explore related code, tests, configs, or documentation. "
+    "You MUST NOT create, modify, or delete any files under any circumstances. "
+    "When you have gathered enough context, output the JSON array as instructed and nothing else.\n\n"
 )
 
 # Header injected before existing PR comments on a re-review.
@@ -115,16 +119,20 @@ PRIOR_COMMENTS_PREAMBLE = (
 )
 
 # User-turn content sent to claude for a first review.
-# Placeholders: {pr_title}, {diff}
+# Placeholders: {pr_title}, {pr_body}, {diff}
 NEW_REVIEW_USER_PROMPT = (
-    "Review this PR and output the JSON array: **{pr_title}**\n\n"
-    "```diff\n{diff}\n```"
+    "Review this PR and output the JSON array.\n\n"
+    "## PR: {pr_title}\n\n"
+    "{pr_body}"
+    "## Diff\n\n```diff\n{diff}\n```"
 )
 
 # User-turn content sent to claude for a re-review.
-# Placeholders: {pr_title}, {prior_ctx}, {diff}
+# Placeholders: {pr_title}, {pr_body}, {prior_ctx}, {diff}
 RE_REVIEW_USER_PROMPT = (
-    "New commits were pushed. Output an updated JSON array for: **{pr_title}**\n\n"
+    "New commits were pushed. Output an updated JSON array.\n\n"
+    "## PR: {pr_title}\n\n"
+    "{pr_body}"
     "{prior_ctx}"
     "## Current Full Diff\n\n```diff\n{diff}\n```"
 )
@@ -173,7 +181,7 @@ def get_review_requested_prs(repo: str, reviewer: str) -> list[dict]:
         "pr", "list",
         "--repo", repo,
         "--state", "open",
-        "--json", "number,title,author,headRefOid,reviewRequests",
+        "--json", "number,title,body,author,headRefOid,reviewRequests",
     )
     prs = json.loads(output)
     return [
@@ -534,19 +542,26 @@ def build_prior_comments_context(comments: list[dict]) -> str:
     """
     Format existing PR comments as context for a re-review prompt.
     Instructs Claude to respect teammate corrections of previous AI mistakes.
+    When the budget is exceeded, the OLDEST comments are dropped so that the
+    most recent discussion (teammate corrections, follow-ups) is always included.
     """
     if not comments:
         return ""
-    lines = [PRIOR_COMMENTS_PREAMBLE]
+    # Build entries newest-first, then reverse for chronological display.
+    kept: list[str] = []
     total = 0
-    for c in comments:
+    for c in reversed(comments):
         entry = f"**@{c['author']}:**\n{c['body']}\n\n---\n\n"
         if total + len(entry) > MAX_COMMENTS_CHARS:
-            lines.append("*(earlier comments omitted — character limit reached)*\n\n")
             break
-        lines.append(entry)
+        kept.append(entry)
         total += len(entry)
-    return "".join(lines)
+    kept.reverse()  # restore chronological order
+    omitted = len(comments) - len(kept)
+    header = [PRIOR_COMMENTS_PREAMBLE]
+    if omitted:
+        header.append(f"*({omitted} oldest comment(s) omitted — showing most recent {len(kept)})*\n\n")
+    return "".join(header + kept)
 
 
 def find_cli(names: tuple[str, ...], label: str) -> str:
@@ -582,11 +597,37 @@ def sync_local_repo_to_dev(local_path: str) -> None:
     git("pull", "--ff-only", "origin", "dev")
 
 
+def save_prompt_debug(pr_title: str, content: str, label: str = "PROMPT") -> Path:
+    """
+    Save an LLM prompt to a rotating debug directory; keeps the latest MAX_PROMPT_FILES files.
+
+    `content` is the exact text that will be / was sent to the backend.
+    `label` is a short tag shown in the file header (e.g. "claude", "ollama", "dry-run").
+    Returns the Path object for the saved file.
+    """
+    PROMPTS_DIR.mkdir(exist_ok=True)
+    slug = re.sub(r"[^\w\-]", "_", pr_title)[:40]
+    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = PROMPTS_DIR / f"{ts_str}_{slug}.txt"
+    header = f"=== [{label.upper()}] {pr_title} ===\n\n"
+    fname.write_text(header + content, encoding="utf-8")
+    # Rotate: delete oldest files beyond the cap
+    files = sorted(PROMPTS_DIR.glob("*.txt"))
+    for old in files[:-MAX_PROMPT_FILES]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    print(f"    [prompts] saved → {fname.name}")
+    return fname
+
+
 def _build_prompts(
     system: str,
     pr_title: str,
     diff: str,
     prior_comments: list[dict] | None,
+    pr_body: str = "",
 ) -> tuple[str, str]:
     """Return (system_prompt, user_content) ready to send to any LLM backend."""
     diff_lines = diff.splitlines()
@@ -597,13 +638,24 @@ def _build_prompts(
     if truncated:
         diff_text += f"\n\n... [diff truncated — showing first {MAX_DIFF_LINES} lines] ..."
 
+    # Truncate and format PR description if present.
+    if pr_body:
+        body_text = pr_body[:MAX_PR_BODY_CHARS]
+        if len(pr_body) > MAX_PR_BODY_CHARS:
+            body_text += f"\n... [description truncated at {MAX_PR_BODY_CHARS} chars] ..."
+        pr_body_section = f"**Description:**\n{body_text}\n\n"
+    else:
+        pr_body_section = ""
+
     prior_ctx = build_prior_comments_context(prior_comments) if prior_comments else ""
     if prior_comments:
         user_content = RE_REVIEW_USER_PROMPT.format(
-            pr_title=pr_title, prior_ctx=prior_ctx, diff=diff_text
+            pr_title=pr_title, pr_body=pr_body_section, prior_ctx=prior_ctx, diff=diff_text
         )
     else:
-        user_content = NEW_REVIEW_USER_PROMPT.format(pr_title=pr_title, diff=diff_text)
+        user_content = NEW_REVIEW_USER_PROMPT.format(
+            pr_title=pr_title, pr_body=pr_body_section, diff=diff_text
+        )
 
     return system, user_content
 
@@ -615,25 +667,29 @@ def call_claude_cli(
     prior_comments: list[dict] | None = None,
     local_path: str | None = None,
     claude_cfg: dict | None = None,
+    pr_body: str = "",
 ) -> str:
     """Call the Claude Code CLI subprocess (original backend)."""
-    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments)
+    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments, pr_body)
     # Only prepend READONLY_NOTICE when a local repo is provided; without local_path
     # Claude has no file-system access anyway, so the notice just wastes tokens.
     notice = READONLY_NOTICE if local_path else ""
     full_prompt = f"{notice}{system_prompt}\n\n---\n\n{user_content}"
 
+    save_prompt_debug(pr_title, full_prompt, "claude")
+
     if local_path:
         sync_local_repo_to_dev(local_path)
 
     cfg = claude_cfg or {}
-    # Default to Haiku — cheapest Claude model, adequate for structured JSON output.
-    model = cfg.get("model", "claude-haiku-4-5-20251001")
+    # "auto" lets the Claude CLI pick the best model for the task.
+    model = cfg.get("model", "auto")
 
     claude = find_cli(("claude", "claude.cmd"), "Claude Code CLI")
     print(f"    [claude] CLI path: {claude}")
     print(f"    [claude] model: {model}")
-    cmd = [claude, "-p", "--model", model]
+    # "auto" means let the CLI pick — omit the --model flag entirely.
+    cmd = [claude, "-p"] if model == "auto" else [claude, "-p", "--model", model]
     print(f"    [claude] Running: {' '.join(cmd[:3])} ...  (stdin: {len(full_prompt)} chars, cwd: {local_path or 'inherited'})")
     result = subprocess.run(
         cmd,
@@ -668,11 +724,12 @@ def call_ollama(
     diff: str,
     ollama_cfg: dict,
     prior_comments: list[dict] | None = None,
+    pr_body: str = "",
 ) -> str:
     """Call a local Ollama model via its REST API."""
     import urllib.request
 
-    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments)
+    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments, pr_body)
     host = ollama_cfg.get("host", "http://localhost:11434").rstrip("/")
     model = ollama_cfg["model"]
     print(f"    [ollama] model: {model}, host: {host}")
@@ -691,7 +748,7 @@ def call_ollama(
     }
     payload = json.dumps(payload_obj).encode("utf-8")
 
-    # Save full payload to a debug file so prompts can be replayed individually.
+    # Save full payload to legacy ollama_prompts/ (JSON, for API replay) and unified llm_prompts/.
     debug_dir = BASE_DIR / "ollama_prompts"
     debug_dir.mkdir(exist_ok=True)
     slug = re.sub(r"[^\w\-]", "_", pr_title)[:40]
@@ -699,6 +756,7 @@ def call_ollama(
     debug_file = debug_dir / f"{slug}.json"
     debug_file.write_text(json.dumps(payload_obj, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"    [ollama] prompt saved → {debug_file}")
+    save_prompt_debug(pr_title, f"=== SYSTEM ===\n{system_prompt}\n\n=== USER ===\n{user_content}", "ollama")
 
     print(f"    [ollama] sending request ({len(payload)} bytes, "
           f"prompt={len(system_prompt)+len(user_content)} chars)...")
@@ -767,13 +825,57 @@ def call_gemini_cli(
     pr_title: str,
     diff: str,
     prior_comments: list[dict] | None = None,
+    pr_body: str = "",
+    local_path: str | None = None,
 ) -> str:
-    """Call the Gemini CLI subprocess (stdin-based, same pattern as Claude CLI)."""
-    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments)
+    """Call the Gemini CLI subprocess using a reference to the saved prompt file."""
+    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments, pr_body)
     full_prompt = f"{READONLY_NOTICE}{system_prompt}\n\n---\n\n{user_content}"
+    
+    # Save the full prompt to get the filename
+    prompt_file = save_prompt_debug(pr_title, full_prompt, "gemini")
+    prompt_filename = prompt_file.name  # Get just the filename
+    
     gemini = find_cli(("gemini", "gemini.cmd"), "Gemini CLI")
     print(f"    [gemini] CLI path: {gemini}")
-    return _run_cli_subprocess([gemini, "-p"], full_prompt, "gemini CLI")
+    
+    # Use a short prompt that references the saved file - this avoids command line length limits
+    # The file will be in llm_prompts/ folder relative to where the CLI runs
+    short_prompt = (
+        f"Read the file 'llm_prompts/{prompt_filename}' and follow the instructions exactly. "
+        f"Output ONLY the raw JSON array, nothing else."
+    )
+    
+    cmd = [gemini, "-p", short_prompt]
+    cmd_display = " ".join([cmd[0], cmd[1], f"<{len(short_prompt)} chars>"])
+    print(f"    [gemini CLI] Running: {cmd_display}")
+    print(f"    [gemini CLI] prompt file: llm_prompts/{prompt_filename} ({len(full_prompt)} chars)")
+    
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=None,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        cwd=local_path or None,
+    )
+    print(f"    [gemini CLI] exit code: {result.returncode}")
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    if stderr:
+        print(f"    [gemini CLI] stderr ({len(stderr)} chars):\n{stderr}")
+    if stdout:
+        print(f"    [gemini CLI] stdout ({len(stdout)} chars):\n{stdout[:2000]}"
+              + (" ... [truncated]" if len(stdout) > 2000 else ""))
+    else:
+        print(f"    [gemini CLI] stdout: (empty)")
+    if result.returncode != 0:
+        raise RuntimeError(f"gemini CLI exited with code {result.returncode}: {stderr}")
+    output = stdout
+    if not output:
+        raise RuntimeError("gemini CLI returned an empty response")
+    return output
 
 
 def call_opencode(
@@ -782,11 +884,14 @@ def call_opencode(
     diff: str,
     opencode_cfg: dict | None = None,
     prior_comments: list[dict] | None = None,
+    pr_body: str = "",
+    local_path: str | None = None,
 ) -> str:
     """Call the OpenCode CLI via `opencode run <message>`."""
     import tempfile
-    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments)
+    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments, pr_body)
     full_prompt = f"{READONLY_NOTICE}{system_prompt}\n\n---\n\n{user_content}"
+    save_prompt_debug(pr_title, full_prompt, "opencode")
     oc = find_cli(("opencode", "opencode.cmd"), "OpenCode CLI")
     print(f"    [opencode] CLI path: {oc}")
     cfg = opencode_cfg or {}
@@ -831,10 +936,13 @@ def call_aider(
     diff: str,
     aider_cfg: dict | None = None,
     prior_comments: list[dict] | None = None,
+    pr_body: str = "",
+    local_path: str | None = None,
 ) -> str:
     """Call Aider in non-interactive mode for code review (no files, no git edits)."""
-    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments)
+    system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments, pr_body)
     full_prompt = f"{system_prompt}\n\n---\n\n{user_content}"
+    save_prompt_debug(pr_title, full_prompt, "aider")
     cfg = aider_cfg or {}
     aider = find_cli(("aider", "aider.cmd"), "Aider")
     cmd = [aider, "--message", full_prompt, "--yes-always", "--no-git", "--no-auto-commits"]
@@ -850,6 +958,7 @@ def call_llm(
     diff: str,
     prior_comments: list[dict] | None = None,
     local_path: str | None = None,
+    pr_body: str = "",
 ) -> str:
     """Dispatch to the configured LLM backend."""
     llm_cfg = config.get("llm", {})
@@ -860,22 +969,22 @@ def call_llm(
         ollama_cfg = llm_cfg.get("ollama", {})
         if not ollama_cfg.get("model"):
             raise RuntimeError("config.json: llm.ollama.model is required when backend=ollama")
-        return call_ollama(system, pr_title, diff, ollama_cfg, prior_comments)
+        return call_ollama(system, pr_title, diff, ollama_cfg, prior_comments, pr_body)
 
     if backend == "gemini":
-        return call_gemini_cli(system, pr_title, diff, prior_comments)
+        return call_gemini_cli(system, pr_title, diff, prior_comments, pr_body, local_path)
 
     if backend == "opencode":
         opencode_cfg = llm_cfg.get("opencode", {})
-        return call_opencode(system, pr_title, diff, opencode_cfg, prior_comments)
+        return call_opencode(system, pr_title, diff, opencode_cfg, prior_comments, pr_body, local_path)
 
     if backend == "aider":
         aider_cfg = llm_cfg.get("aider", {})
-        return call_aider(system, pr_title, diff, aider_cfg, prior_comments)
+        return call_aider(system, pr_title, diff, aider_cfg, prior_comments, pr_body, local_path)
 
     # Fallback / explicit: claude CLI
     claude_cfg = llm_cfg.get("claude", {})
-    return call_claude_cli(system, pr_title, diff, prior_comments, local_path, claude_cfg)
+    return call_claude_cli(system, pr_title, diff, prior_comments, local_path, claude_cfg, pr_body)
 
 
 # ---------------------------------------------------------------------------
@@ -1258,12 +1367,12 @@ def rotate_log() -> None:
         LOG_FILE.write_text("".join(lines[-LOG_MAX_LINES:]), encoding="utf-8")
 
 
-def main() -> None:
+def main(dry_run: bool = False) -> None:
     # pythonw.exe (windowless) sets sys.stdout/stderr to None.
     # Redirect both to the log file so output is preserved.
     if sys.stdout is None:
         rotate_log()
-        _log = open(LOG_FILE, "a", encoding="utf-8")
+        _log = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
         sys.stdout = sys.stderr = _log
     else:
         # Console mode (manual run): ensure UTF-8 so emoji chars don't crash.
@@ -1271,6 +1380,9 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
         print(f"[NOTE] Running in console mode — output is NOT written to {LOG_FILE}")
+
+    if dry_run:
+        print("[NOTE] Dry-run mode — PRs and diffs will be fetched, prompts built and saved, but the LLM will NOT be called and no comments or emails will be sent.")
 
     config = load_config()
     reviewer = config["reviewer_username"]
@@ -1314,6 +1426,7 @@ def main() -> None:
                 continue
 
             title = pr["title"]
+            body = (pr.get("body") or "").strip()
             author = pr["author"]["login"]
 
             # Detect re-review: same PR number reviewed before at a different SHA.
@@ -1363,7 +1476,13 @@ def main() -> None:
                     save_state(state)
                     continue
 
-                raw = call_llm(config, system_prompt, title, diff, prior_comments, repo_config.get("local_path"))
+                if dry_run:
+                    sys_p, user_p = _build_prompts(system_prompt, title, diff, prior_comments or None, body)
+                    save_prompt_debug(title, f"=== SYSTEM ===\n{sys_p}\n\n=== USER ===\n{user_p}", "dry-run")
+                    print(f"    PR #{number} — [dry-run] prompt saved to {PROMPTS_DIR.name}/. Skipping LLM call.")
+                    continue
+
+                raw = call_llm(config, system_prompt, title, diff, prior_comments, repo_config.get("local_path"), body)
                 comments = parse_review_comments(raw)
                 is_critical = has_critical_issues(comments)
 
@@ -1456,8 +1575,11 @@ def main() -> None:
             save_state(state)
 
     # ── 2. Alert on merged PRs that had critical issues ───────────────────
-    print(f"\n  Checking recently merged PRs for critical-issue alerts...")
-    check_merged_prs(config, state)
+    if dry_run:
+        print(f"\n  [dry-run] Skipping merged-PR alert check.")
+    else:
+        print(f"\n  Checking recently merged PRs for critical-issue alerts...")
+        check_merged_prs(config, state)
 
     print(f"\n[{ts()}] Done. Reviewed {total_reviewed} PR(s) across {len(repos)} repo(s).")
 
@@ -1466,4 +1588,5 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "reset-review":
         cmd_reset_review()
     else:
-        main()
+        _dry_run = "--dry-run" in sys.argv
+        main(dry_run=_dry_run)

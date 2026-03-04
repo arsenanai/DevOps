@@ -1,7 +1,6 @@
 # setup_task.ps1
 # Registers a Windows Task Scheduler task that runs the PR reviewer:
-#   - immediately on every user logon
-#   - then every 1 hour while logged in
+#   - every 2 hours at 9:00, 11:00, 13:00, 15:00, 17:00 on weekdays (Monday-Friday)
 # Run once from PowerShell (no Administrator needed for current-user tasks).
 #
 # Usage:
@@ -34,21 +33,24 @@ $Action = New-ScheduledTaskAction `
     -Argument "`"$ScriptPath`"" `
     -WorkingDirectory $ScriptDir
 
-# Trigger 1: run at every logon (catches the first run after system boot)
-$TriggerLogon = New-ScheduledTaskTrigger `
-    -AtLogOn `
-    -User $env:USERNAME
+# Create a single weekly trigger that runs every 2 hours during working hours (9:00-17:00) on weekdays
+$Triggers = @()
+$trigger = New-ScheduledTaskTrigger `
+    -Weekly `
+    -At "09:00" `
+    -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday
 
-# Trigger 2: repeat every 1 Hour while logged in
-$TriggerRepeat = New-ScheduledTaskTrigger `
-    -Once `
-    -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Hours 1)
-
-$Triggers = @($TriggerLogon, $TriggerRepeat)
+# Manually build the repetition pattern (run every 2 hours for 8 hours total duration)
+# We borrow the repetition pattern object from a 'Once' trigger because it's the easiest way to create it.
+$tempTrigger = New-ScheduledTaskTrigger -Once -At "09:00" `
+    -RepetitionInterval (New-TimeSpan -Hours 2) `
+    -RepetitionDuration (New-TimeSpan -Hours 8)
+$trigger.Repetition = $tempTrigger.Repetition
+$trigger.Repetition.StopAtDurationEnd = $false
+$Triggers += $trigger
 
 $Settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit  (New-TimeSpan -Minutes 10) `
+    -ExecutionTimeLimit  (New-TimeSpan -Minutes 60) `
     -RestartCount        2 `
     -RestartInterval     (New-TimeSpan -Minutes 1) `
     -StartWhenAvailable `
@@ -74,7 +76,7 @@ if ($Existing) {
 }
 
 Write-Host ""
-Write-Host "All done. The reviewer runs on logon + every 1 hour."
+Write-Host "All done. The reviewer runs during working hours (9:00, 11:00, 13:00, 15:00, 17:00) every 2 hours."
 Write-Host "  Logs  : $LogFile"
 Write-Host "  State : $(Join-Path $ScriptDir 'reviewed_prs.json')"
 Write-Host "  Config: $(Join-Path $ScriptDir 'config.json')"
