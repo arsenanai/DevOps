@@ -850,35 +850,37 @@ def call_gemini_cli(
     system: str,
     pr_title: str,
     diff: str,
+    gemini_cfg: dict | None = None,
     prior_comments: list[dict] | None = None,
     pr_body: str = "",
     local_path: str | None = None,
 ) -> str:
-    """Call the Gemini CLI subprocess using a reference to the saved prompt file."""
+    """Call the Gemini CLI subprocess using stdin for the prompt content."""
     system_prompt, user_content = _build_prompts(system, pr_title, diff, prior_comments, pr_body)
     full_prompt = f"{READONLY_NOTICE}{system_prompt}\n\n---\n\n{user_content}"
     
-    # Save the full prompt to get the filename
-    prompt_file = save_prompt_debug(pr_title, full_prompt, "gemini")
-    prompt_filename = prompt_file.name  # Get just the filename
+    save_prompt_debug(pr_title, full_prompt, "gemini")
+    
+    cfg = gemini_cfg or {}
+    model = cfg.get("model")
     
     gemini = find_cli(("gemini", "gemini.cmd"), "Gemini CLI")
     print(f"    [gemini] CLI path: {gemini}")
+    if model:
+        print(f"    [gemini] model: {model}")
     
-    # Use a short prompt that references the saved file - this avoids command line length limits
-    # The file will be in llm_prompts/ folder relative to where the CLI runs
-    short_prompt = (
-        f"Read the file 'llm_prompts/{prompt_filename}' and follow the instructions exactly. "
-        f"Output ONLY the raw JSON array, nothing else."
-    )
-    
-    cmd = [gemini, "-p", short_prompt]
-    cmd_display = " ".join([cmd[0], cmd[1], f"<{len(short_prompt)} chars>"])
-    print(f"    [gemini CLI] Running: {cmd_display}")
-    print(f"    [gemini CLI] prompt file: llm_prompts/{prompt_filename} ({len(full_prompt)} chars)")
+    # Use -p "Follow instructions." and pass the actual prompt via stdin.
+    # --raw-output --accept-raw-output-risk ensures clean output without ANSI or warnings.
+    # --yolo ensures it won't prompt for approvals if it decides to use tools.
+    cmd = [gemini, "-p", "Follow instructions.", "--raw-output", "--accept-raw-output-risk", "--yolo"]
+    if model:
+        cmd.extend(["--model", model])
+        
+    print(f"    [gemini CLI] Running: {' '.join(cmd[:3])} ... (stdin: {len(full_prompt)} chars, cwd: {local_path or 'inherited'})")
     
     result = subprocess.run(
         cmd,
+        input=full_prompt,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -892,8 +894,8 @@ def call_gemini_cli(
     if stderr:
         print(f"    [gemini CLI] stderr ({len(stderr)} chars):\n{stderr}")
     if stdout:
-        print(f"    [gemini CLI] stdout ({len(stdout)} chars):\n{stdout[:2000]}"
-              + (" ... [truncated]" if len(stdout) > 2000 else ""))
+        print(f"    [gemini CLI] stdout ({len(stdout)} chars):\n{stdout[:1000]}"
+              + (" ... [truncated]" if len(stdout) > 1000 else ""))
     else:
         print(f"    [gemini CLI] stdout: (empty)")
     if result.returncode != 0:
@@ -998,7 +1000,8 @@ def call_llm(
         return call_ollama(system, pr_title, diff, ollama_cfg, prior_comments, pr_body)
 
     if backend == "gemini":
-        return call_gemini_cli(system, pr_title, diff, prior_comments, pr_body, local_path)
+        gemini_cfg = llm_cfg.get("gemini", {})
+        return call_gemini_cli(system, pr_title, diff, gemini_cfg, prior_comments, pr_body, local_path)
 
     if backend == "opencode":
         opencode_cfg = llm_cfg.get("opencode", {})

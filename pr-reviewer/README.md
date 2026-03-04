@@ -1,6 +1,6 @@
 # PR Reviewer
 
-Automated AI code reviewer that monitors GitHub repositories and posts Claude-generated reviews on pull requests. Runs silently in the background via Windows Task Scheduler.
+Automated AI code reviewer that monitors GitHub repositories and posts AI-generated reviews (Claude, Gemini, etc.) on pull requests. Runs silently in the background via Windows Task Scheduler.
 
 ## Features
 
@@ -21,6 +21,7 @@ Automated AI code reviewer that monitors GitHub repositories and posts Claude-ge
 - Python 3.11+
 - [GitHub CLI (`gh`)](https://cli.github.com/) — authenticated (`gh auth login`)
 - [Claude Code CLI (`claude`)](https://github.com/anthropics/claude-code) — authenticated
+- [Gemini CLI (`gemini`)](https://github.com/google/gemini-cli) — authenticated
 
 ```
 pip install -r requirements.txt
