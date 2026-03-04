@@ -1,5 +1,12 @@
 {
   "reviewer_username": "github_username",
+  "schedule": {
+    "enabled_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+    "start_time": "00:00",
+    "end_time": "24:00",
+    "frequency_hours": 1,
+    "_comment_schedule": "Schedule configuration for automated PR reviewer. enabled_days: array of weekday names. start_time/end_time: 24-hour format. frequency_hours: how often to run within the time range."
+  },
   "llm": {
     "backend": "opencode",
     "_comment_backend": "Backends: 'opencode' (default), 'claude', 'gemini', 'ollama', 'aider'.",

@@ -1,6 +1,6 @@
 # setup_task.ps1
 # Registers a Windows Task Scheduler task that runs the PR reviewer:
-#   - every 2 hours at 9:00, 11:00, 13:00, 15:00, 17:00 on weekdays (Monday-Friday)
+#   - schedule is configurable in config.json under the "schedule" section
 # Run once from PowerShell (no Administrator needed for current-user tasks).
 #
 # Usage:
@@ -14,9 +14,45 @@
 
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ScriptPath = Join-Path $ScriptDir "review_prs.py"
+$ConfigPath = Join-Path $ScriptDir "config.json"
 $PythonExe  = (Get-Command python -ErrorAction Stop).Source
 $TaskName   = "RoqedPRReviewer"
 $LogFile    = Join-Path $ScriptDir "reviewer.log"
+
+# Read configuration from config.json
+if (-not (Test-Path $ConfigPath)) {
+    Write-Error "Config file not found: $ConfigPath"
+    Write-Error "Please copy config.json.example to config.json and configure it."
+    exit 1
+}
+
+try {
+    $Config = Get-Content $ConfigPath | ConvertFrom-Json
+    $Schedule = $Config.schedule
+    
+    # Default values if schedule section is missing
+    if (-not $Schedule) {
+        $Schedule = @{
+            enabled_days = @("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
+            start_time = "00:00"
+            end_time = "24:00"
+            frequency_hours = 1
+        }
+    }
+    
+    $EnabledDays = $Schedule.enabled_days
+    $StartTime = $Schedule.start_time
+    $EndTime = $Schedule.end_time
+    $FrequencyHours = $Schedule.frequency_hours
+    
+    Write-Host "Schedule configuration:"
+    Write-Host "  Days: $($EnabledDays -join ', ')"
+    Write-Host "  Time: $StartTime - $EndTime"
+    Write-Host "  Frequency: every $FrequencyHours hour(s)"
+} catch {
+    Write-Error "Failed to read config.json: $_"
+    exit 1
+}
 
 # Use pythonw.exe (windowless) so no CMD window flashes when the task runs.
 # pythonw.exe lives next to python.exe in the same Python installation directory.
@@ -33,18 +69,27 @@ $Action = New-ScheduledTaskAction `
     -Argument "`"$ScriptPath`"" `
     -WorkingDirectory $ScriptDir
 
-# Create a single weekly trigger that runs every 2 hours during working hours (9:00-17:00) on weekdays
+# Create a weekly trigger using configuration from config.json
 $Triggers = @()
 $trigger = New-ScheduledTaskTrigger `
     -Weekly `
-    -At "09:00" `
-    -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday
+    -At $StartTime `
+    -DaysOfWeek $EnabledDays
 
-# Manually build the repetition pattern (run every 2 hours for 8 hours total duration)
-# We borrow the repetition pattern object from a 'Once' trigger because it's the easiest way to create it.
-$tempTrigger = New-ScheduledTaskTrigger -Once -At "09:00" `
-    -RepetitionInterval (New-TimeSpan -Hours 2) `
-    -RepetitionDuration (New-TimeSpan -Hours 8)
+# Calculate duration between start and end times
+$StartDateTime = [DateTime]::Parse($StartTime)
+$EndDateTime = [DateTime]::Parse($EndTime)
+$DurationHours = ($EndDateTime - $StartDateTime).TotalHours
+
+# Handle case where end time is next day (e.g., 22:00 to 06:00)
+if ($DurationHours -lt 0) {
+    $DurationHours += 24
+}
+
+# Manually build the repetition pattern using config values
+$tempTrigger = New-ScheduledTaskTrigger -Once -At $StartTime `
+    -RepetitionInterval (New-TimeSpan -Hours $FrequencyHours) `
+    -RepetitionDuration (New-TimeSpan -Hours $DurationHours)
 $trigger.Repetition = $tempTrigger.Repetition
 $trigger.Repetition.StopAtDurationEnd = $false
 $Triggers += $trigger
@@ -76,7 +121,7 @@ if ($Existing) {
 }
 
 Write-Host ""
-Write-Host "All done. The reviewer runs during working hours (9:00, 11:00, 13:00, 15:00, 17:00) every 2 hours."
+Write-Host "All done. The reviewer will run every $FrequencyHours hour(s) on $($EnabledDays -join ', ') from $StartTime to $EndTime."
 Write-Host "  Logs  : $LogFile"
 Write-Host "  State : $(Join-Path $ScriptDir 'reviewed_prs.json')"
 Write-Host "  Config: $(Join-Path $ScriptDir 'config.json')"
